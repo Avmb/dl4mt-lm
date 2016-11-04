@@ -2,7 +2,7 @@ import os
 import sys
 import argparse
 
-from lm import train
+from small_lm_dr import train
 
 def main(job_id):
     parser = argparse.ArgumentParser(description='Train a language model.')
@@ -13,7 +13,6 @@ def main(job_id):
     parser.add_argument('-t', '--test_dataset', help='test dataset')
     parser.add_argument('-r', '--reload', help='continue training from existing model (default: False)', type=bool, default=False)
     parser.add_argument('-m', '--max_length', help='maximum sentence length (default: 500)', type=int, default=500)
-    parser.add_argument('-e', '--dim_word', help='word embedding dimension (default: 512)', type=int, default=512)
     parser.add_argument('-d', '--dim', help='RNN state dimension (default: 1024)', type=int, default=1024)
     parser.add_argument('-w', '--n_words', help='vocabulary size (default: number of words in dictionary file)', type=int)
     parser.add_argument('-o', '--optimizer', help='optimizer (default: adam)', choices=['adam', 'rmsprop', 'adadelta', 'sgd'], default='adam')
@@ -24,6 +23,9 @@ def main(job_id):
     parser.add_argument('--rnn_rank', help='maximum rank of RNN recurrent matrices, integer or "full" (default: full)', default='full')
     parser.add_argument('--rnn_plus_diagonal', help='use low-rank plus diagonal parametrization, has effect only if rank is not "full" (default: True)', type=bool, default=True)
     parser.add_argument('--rnn_share_proj_matrix', help='share recurrent projection matrices between gates in low-rank and low-rank plus diagonal parametrizations (default: False)', type=bool, default=False)
+    parser.add_argument('--dropout_retain_probability_word', help="retain probability for word embedding dropout (default: 0.9)", type=float, default=0.9)
+    parser.add_argument('--dropout_retain_probability_rec', help="retain probability for recurrent matrices dropout (default: 0.5)", type=float, default=0.5)
+    parser.add_argument('--dropout_retain_probability_readout', help="retain probability for readout layer dropout (default: 0.5)", type=float, default=0.5)
     parser.add_argument('--batch_size', help='training mini-batch size (default: 32)', type=int, default=32)
     parser.add_argument('--eval_batch_size', help='evaluation mini-batch size (default: 128)', type=int, default=128)
     parser.add_argument('--valid_freq', help='validation frequency in mini-batches (default: 5000)', type=int, default=5000)
@@ -36,7 +38,6 @@ def main(job_id):
     train(
         saveto=args.model,
         reload_=args.reload,
-        dim_word=args.dim_word,
         dim=args.dim,
         n_words=args.n_words,
         clip_c=args.clip_c,
@@ -45,6 +46,9 @@ def main(job_id):
         decoder_rank=('full' if args.rnn_rank == 'full' else int(args.rnn_rank)),
         decoder_plus_diagonal = args.rnn_plus_diagonal,
         decoder_share_proj_matrix = args.rnn_share_proj_matrix,
+        retain_probability_word = args.dropout_retain_probability_word,
+        retain_probability_rec = args.dropout_retain_probability_rec,
+        retain_probability_readout = args.dropout_retain_probability_readout,
         lrate=args.learning_rate,
         optimizer=args.optimizer,
         maxlen=args.max_length,

@@ -1,5 +1,5 @@
 '''
-Build a simple neural language model using GRU units
+Build a simple neural language model using GRU units, without embedding layers or non-linear readout
 '''
 import theano
 import theano.tensor as tensor
@@ -268,12 +268,14 @@ def param_init_gru(options, params, prefix='gru', nin=None, dim=None, rank='full
 
 def gru_layer(tparams, state_below, options, prefix='gru', mask=None,
               profile=False,
+              integer_input=False,
               rank='full',
               share_proj_matrix=False,
               plus_diagonal=True,
               **kwargs):
     nsteps = state_below.shape[0]
-    if state_below.ndim == 3:
+    minibatched_mode_ndim = 2 if integer_input else 3
+    if state_below.ndim == minibatched_mode_ndim:
         n_samples = state_below.shape[1]
     else:
         n_samples = 1
@@ -289,13 +291,24 @@ def gru_layer(tparams, state_below, options, prefix='gru', mask=None,
             return _x[:, :, n*dim:(n+1)*dim]
         return _x[:, n*dim:(n+1)*dim]
 
-    # state_below is the input word embeddings
-    # input to the gates, concatenated
-    state_below_ = tensor.dot(state_below, tparams[pp(prefix, 'W')]) + \
-        tparams[pp(prefix, 'b')]
-    # input to compute the hidden state proposal
-    state_belowx = tensor.dot(state_below, tparams[pp(prefix, 'Wx')]) + \
-        tparams[pp(prefix, 'bx')]
+    if integer_input:
+        state_below_flat = state_below.flatten()
+        # input to the gates, concatenated
+        state_below_ = tparams[pp(prefix, 'W')][state_below_flat] + tparams[pp(prefix, 'b')]
+        pre_shape_ = (nsteps, n_samples, 2*dim)
+        state_below_ = state_below_.reshape(pre_shape_)
+        # input to compute the hidden state proposal
+        state_belowx = tparams[pp(prefix, 'Wx')][state_below_flat] + tparams[pp(prefix, 'bx')]
+        pre_shapex = (nsteps, n_samples, dim)
+        state_belowx = state_belowx.reshape(pre_shapex)
+    else:
+        # state_below is the input word embeddings
+        # input to the gates, concatenated
+        state_below_ = tensor.dot(state_below, tparams[pp(prefix, 'W')]) + \
+            tparams[pp(prefix, 'b')]
+        # input to compute the hidden state proposal
+        state_belowx = tensor.dot(state_below, tparams[pp(prefix, 'Wx')]) + \
+            tparams[pp(prefix, 'bx')]
             
     # step function to be used by scan
     # arguments    | sequences |outputs-info| non-seqs
@@ -362,25 +375,17 @@ def gru_layer(tparams, state_below, options, prefix='gru', mask=None,
 def init_params(options):
     params = OrderedDict()
     # embedding
-    params['Wemb'] = norm_weight(options['n_words'], options['dim_word'])
     params = get_layer(options['decoder'])[0](options, params,
                                               prefix='decoder',
-                                              nin=options['dim_word'],
+                                              nin=options['n_words'],
                                               dim=options['dim'],
                                               rank=options['decoder_rank'],
                                               share_proj_matrix=options['decoder_share_proj_matrix'],
                                               plus_diagonal=options['decoder_plus_diagonal'])
     # readout
-    params = get_layer('ff')[0](options, params, prefix='ff_logit_lstm',
-                                nin=options['dim'], nout=options['dim_word'],
+    params = get_layer('ff')[0](options, params, prefix='ff_out',
+                                nin=options['dim'], nout=options['n_words'],
                                 ortho=False)
-    params = get_layer('ff')[0](options, params, prefix='ff_logit_prev',
-                                nin=options['dim_word'],
-                                nout=options['dim_word'], ortho=False)
-    params = get_layer('ff')[0](options, params, prefix='ff_logit',
-                                nin=options['dim_word'],
-                                nout=options['n_words'])
-
     return params
 
 
@@ -399,17 +404,16 @@ def build_model(tparams, options):
     n_samples = x.shape[1]
 
     # input
-    emb = tparams['Wemb'][x.flatten()]
-    emb = emb.reshape([n_timesteps, n_samples, options['dim_word']])
-    emb_shifted = tensor.zeros_like(emb)
-    emb_shifted = tensor.set_subtensor(emb_shifted[1:], emb[:-1])
-    emb = emb_shifted
-    opt_ret['emb'] = emb
+
+    x_shifted = tensor.zeros_like(x, dtype='int64')
+    x_shifted = tensor.set_subtensor(x_shifted[1:], x[:-1])
+    opt_ret['x_shifted'] = x_shifted
 
     # pass through gru layer, recurrence here
-    proj = get_layer(options['decoder'])[1](tparams, emb, options,
+    proj = get_layer(options['decoder'])[1](tparams, x_shifted, options,
                                             prefix='decoder',
                                             mask=x_mask,
+                                            integer_input=True,
                                             profile=profile,
                                             rank=options['decoder_rank'],
                                             share_proj_matrix=options['decoder_share_proj_matrix'],
@@ -418,13 +422,8 @@ def build_model(tparams, options):
     opt_ret['proj_h'] = proj_h
 
     # compute word probabilities
-    logit_lstm = get_layer('ff')[1](tparams, proj_h, options,
-                                    prefix='ff_logit_lstm', activ='linear')
-    logit_prev = get_layer('ff')[1](tparams, emb, options,
-                                    prefix='ff_logit_prev', activ='linear')
-    logit = tensor.tanh(logit_lstm+logit_prev)
-    logit = get_layer('ff')[1](tparams, logit, options, prefix='ff_logit',
-                               activ='linear')
+    logit = get_layer('ff')[1](tparams, proj_h, options,
+                                    prefix='ff_out', activ='linear')
     logit_shp = logit.shape
     probs = tensor.nnet.softmax(
         logit.reshape([logit_shp[0]*logit_shp[1], logit_shp[2]]))
@@ -436,81 +435,10 @@ def build_model(tparams, options):
     cost = cost.reshape([x.shape[0], x.shape[1]])
     opt_ret['cost_per_sample'] = cost
     #cost = (cost * x_mask).sum(0)
-    cost = (cost * x_mask).mean(0)   # Average cost over words
+    #cost = (cost * x_mask).mean(0)   # Average cost over words (wrong)
+    cost = (cost * x_mask).sum(0) / x_mask.sum(0) # Average cost over words
 
     return trng, use_noise, x, x_mask, opt_ret, cost
-
-
-# build a sampler
-def build_sampler(tparams, options, trng):
-    # x: 1 x 1
-    y = tensor.vector('y_sampler', dtype='int64')
-    init_state = tensor.matrix('init_state', dtype='float32')
-
-    # if it's the first word, emb should be all zero
-    emb = tensor.switch(y[:, None] < 0,
-                        tensor.alloc(0., 1, tparams['Wemb'].shape[1]),
-                        tparams['Wemb'][y])
-
-    # apply one step of gru layer
-    proj = get_layer(options['decoder'])[1](tparams, emb, options,
-                                            prefix='decoder',
-                                            mask=None,
-                                            one_step=True,
-                                            init_state=init_state,
-                                            profile=profile,
-                                            rank=options['decoder_rank'],
-                                            share_proj_matrix=options['decoder_share_proj_matrix'],
-                                            plus_diagonal=options['decoder_plus_diagonal'])
-    next_state = proj[0]
-
-    # compute the output probability dist and sample
-    logit_lstm = get_layer('ff')[1](tparams, next_state, options,
-                                    prefix='ff_logit_lstm', activ='linear')
-    logit_prev = get_layer('ff')[1](tparams, emb, options,
-                                    prefix='ff_logit_prev', activ='linear')
-    logit = tensor.tanh(logit_lstm+logit_prev)
-    logit = get_layer('ff')[1](tparams, logit, options,
-                               prefix='ff_logit', activ='linear')
-    next_probs = tensor.nnet.softmax(logit)
-    next_sample = trng.multinomial(pvals=next_probs).argmax(1)
-
-    # next word probability
-    print >> sys.stderr, 'Building f_next..',
-    inps = [y, init_state]
-    outs = [next_probs, next_sample, next_state]
-    f_next = theano.function(inps, outs, name='f_next', profile=profile)
-    print >> sys.stderr, 'Done'
-
-    return f_next
-
-
-# generate sample
-def gen_sample(tparams, f_next, options, trng=None, maxlen=30, argmax=False):
-
-    sample = []
-    sample_score = 0
-
-    # initial token is indicated by a -1 and initial state is zero
-    next_w = -1 * numpy.ones((1,)).astype('int64')
-    next_state = numpy.zeros((1, options['dim'])).astype('float32')
-
-    for ii in xrange(maxlen):
-        inps = [next_w, next_state]
-        ret = f_next(*inps)
-        next_p, next_w, next_state = ret[0], ret[1], ret[2]
-
-        if argmax:
-            nw = next_p[0].argmax()
-        else:
-            nw = next_w[0]
-        sample.append(nw)
-        sample_score += next_p[0, nw]
-        if nw == 0:
-            break
-
-    return sample, sample_score
-
 
 # calculate the log probablities on a given corpus using language model
 def pred_probs(f_log_probs, prepare_data, options, iterator, verbose=True):
@@ -658,7 +586,7 @@ def sgd(lr, tparams, grads, x, mask, y, cost):
     return f_grad_shared, f_update
 
 
-def train(dim_word=100,  # word vector dimensionality
+def train(
           dim=1000,  # the number of GRU units
           decoder='gru',
           patience=10,  # early stopping patience

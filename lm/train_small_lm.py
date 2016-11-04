@@ -2,7 +2,7 @@ import os
 import sys
 import argparse
 
-from lm import train
+from small_lm import train
 
 def main(job_id):
     parser = argparse.ArgumentParser(description='Train a language model.')
@@ -13,7 +13,6 @@ def main(job_id):
     parser.add_argument('-t', '--test_dataset', help='test dataset')
     parser.add_argument('-r', '--reload', help='continue training from existing model (default: False)', type=bool, default=False)
     parser.add_argument('-m', '--max_length', help='maximum sentence length (default: 500)', type=int, default=500)
-    parser.add_argument('-e', '--dim_word', help='word embedding dimension (default: 512)', type=int, default=512)
     parser.add_argument('-d', '--dim', help='RNN state dimension (default: 1024)', type=int, default=1024)
     parser.add_argument('-w', '--n_words', help='vocabulary size (default: number of words in dictionary file)', type=int)
     parser.add_argument('-o', '--optimizer', help='optimizer (default: adam)', choices=['adam', 'rmsprop', 'adadelta', 'sgd'], default='adam')
@@ -36,7 +35,6 @@ def main(job_id):
     train(
         saveto=args.model,
         reload_=args.reload,
-        dim_word=args.dim_word,
         dim=args.dim,
         n_words=args.n_words,
         clip_c=args.clip_c,

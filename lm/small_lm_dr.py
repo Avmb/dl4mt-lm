@@ -1,5 +1,5 @@
 '''
-Build a simple neural language model using GRU units
+Build a simple neural language model using GRU units, without embedding layers or non-linear readout
 '''
 import theano
 import theano.tensor as tensor
@@ -51,6 +51,14 @@ def dropout_layer(state_before, use_noise, trng):
         state_before * 0.5)
     return proj
 
+# dropout that will be re-used at different time steps
+def shared_dropout_layer(shape, use_noise, trng, value):
+    proj = tensor.switch(
+        use_noise,
+        trng.binomial(shape, p=value, n=1,
+                                     dtype='float32') / theano.shared(numpy.float32(value)),
+        1.0)
+    return proj
 
 # make prefix-appended name
 def pp(prefix, name):
@@ -268,12 +276,16 @@ def param_init_gru(options, params, prefix='gru', nin=None, dim=None, rank='full
 
 def gru_layer(tparams, state_below, options, prefix='gru', mask=None,
               profile=False,
+              integer_input=False,
+              word_dropout=None,
+              rec_dropout=None,
               rank='full',
               share_proj_matrix=False,
               plus_diagonal=True,
               **kwargs):
     nsteps = state_below.shape[0]
-    if state_below.ndim == 3:
+    minibatched_mode_ndim = 2 if integer_input else 3
+    if state_below.ndim == minibatched_mode_ndim:
         n_samples = state_below.shape[1]
     else:
         n_samples = 1
@@ -289,19 +301,35 @@ def gru_layer(tparams, state_below, options, prefix='gru', mask=None,
             return _x[:, :, n*dim:(n+1)*dim]
         return _x[:, n*dim:(n+1)*dim]
 
-    # state_below is the input word embeddings
-    # input to the gates, concatenated
-    state_below_ = tensor.dot(state_below, tparams[pp(prefix, 'W')]) + \
-        tparams[pp(prefix, 'b')]
-    # input to compute the hidden state proposal
-    state_belowx = tensor.dot(state_below, tparams[pp(prefix, 'Wx')]) + \
-        tparams[pp(prefix, 'bx')]
+    if integer_input:
+        state_below_flat = state_below.flatten()
+        # input to the gates, concatenated
+        state_below_ = tparams[pp(prefix, 'W')][state_below_flat] + tparams[pp(prefix, 'b')]
+        pre_shape_ = (nsteps, n_samples, 2*dim)
+        state_below_ = state_below_.reshape(pre_shape_)
+        # input to compute the hidden state proposal
+        state_belowx = tparams[pp(prefix, 'Wx')][state_below_flat] + tparams[pp(prefix, 'bx')]
+        pre_shapex = (nsteps, n_samples, dim)
+        state_belowx = state_belowx.reshape(pre_shapex)
+        if word_dropout != None:
+            state_below_ *= word_dropout
+            state_belowx *= word_dropout
+    else:
+        # state_below is the input word embeddings
+        # input to the gates, concatenated
+        state_below_ = tensor.dot(state_below, tparams[pp(prefix, 'W')]) + \
+            tparams[pp(prefix, 'b')]
+        # input to compute the hidden state proposal
+        state_belowx = tensor.dot(state_below, tparams[pp(prefix, 'Wx')]) + \
+            tparams[pp(prefix, 'bx')]
             
     # step function to be used by scan
     # arguments    | sequences |outputs-info| non-seqs
     def _step_slice(m_, x_, xx_, h_):
+        h_.name='h_'
         if rank == 'full':
-            preact = tensor.dot(h_, tparams[pp(prefix, 'U')])
+            preact = tensor.dot(h_ * rec_dropout[0], tparams[pp(prefix, 'U')])
+            preact.name='preact'
             preact += x_
 
             # reset and update gates
@@ -309,27 +337,32 @@ def gru_layer(tparams, state_below, options, prefix='gru', mask=None,
             u = tensor.nnet.sigmoid(_slice(preact, 1, dim))
 
             # compute the hidden state proposal
-            preactx = tensor.dot(h_, tparams[pp(prefix, 'Ux')])
+            preactx = tensor.dot(h_ * rec_dropout[1], tparams[pp(prefix, 'Ux')])
             preactx = preactx * r
             preactx = preactx + xx_
         else:
             if share_proj_matrix:
-                proj = tensor.dot(h_, tparams[pp(prefix, 'U_proj')])
+                h_dr = h_ * rec_dropout[0] if rec_dropout != None else h_
+                hu_dr, hr_dr, hx_dr = h_dr, h_dr, h_dr
+                proj = tensor.dot(h_dr, tparams[pp(prefix, 'U_proj')])
                 proj_u, proj_r, proj_x = proj, proj, proj
             else:
-                proj_u = tensor.dot(h_, tparams[pp(prefix, 'U_proj_u')])
-                proj_r = tensor.dot(h_, tparams[pp(prefix, 'U_proj_r')])
-                proj_x = tensor.dot(h_, tparams[pp(prefix, 'U_proj_x')])
+                hu_dr = h_ * rec_dropout[0] if rec_dropout != None else h_
+                hr_dr = h_ * rec_dropout[1] if rec_dropout != None else h_
+                hx_dr = h_ * rec_dropout[2] if rec_dropout != None else h_
+                proj_u = tensor.dot(hu_dr, tparams[pp(prefix, 'U_proj_u')])
+                proj_r = tensor.dot(hr_dr, tparams[pp(prefix, 'U_proj_r')])
+                proj_x = tensor.dot(hx_dr, tparams[pp(prefix, 'U_proj_x')])
             preact_u = tensor.dot(proj_u, tparams[pp(prefix, 'U_expand_u')]) + _slice(x_, 0, dim)
             preact_r = tensor.dot(proj_r, tparams[pp(prefix, 'U_expand_r')]) + _slice(x_, 1, dim)
             if plus_diagonal:
-                 preact_u += h_ * tparams[pp(prefix, 'U_diag_u')]
-                 preact_r += h_ * tparams[pp(prefix, 'U_diag_r')]
+                 preact_u += hu_dr * tparams[pp(prefix, 'U_diag_u')]
+                 preact_r += hr_dr * tparams[pp(prefix, 'U_diag_r')]
             u = tensor.nnet.sigmoid(preact_u)
             r = tensor.nnet.sigmoid(preact_r)
             pre_preactx = tensor.dot(proj_x, tparams[pp(prefix, 'U_expand_x')])
             if plus_diagonal:
-                pre_preactx += h_ * tparams[pp(prefix, 'U_diag_x')]
+                pre_preactx += hx_dr * tparams[pp(prefix, 'U_diag_x')]
             preactx = pre_preactx * r + xx_
             
 
@@ -362,25 +395,17 @@ def gru_layer(tparams, state_below, options, prefix='gru', mask=None,
 def init_params(options):
     params = OrderedDict()
     # embedding
-    params['Wemb'] = norm_weight(options['n_words'], options['dim_word'])
     params = get_layer(options['decoder'])[0](options, params,
                                               prefix='decoder',
-                                              nin=options['dim_word'],
+                                              nin=options['n_words'],
                                               dim=options['dim'],
                                               rank=options['decoder_rank'],
                                               share_proj_matrix=options['decoder_share_proj_matrix'],
                                               plus_diagonal=options['decoder_plus_diagonal'])
     # readout
-    params = get_layer('ff')[0](options, params, prefix='ff_logit_lstm',
-                                nin=options['dim'], nout=options['dim_word'],
+    params = get_layer('ff')[0](options, params, prefix='ff_out',
+                                nin=options['dim'], nout=options['n_words'],
                                 ortho=False)
-    params = get_layer('ff')[0](options, params, prefix='ff_logit_prev',
-                                nin=options['dim_word'],
-                                nout=options['dim_word'], ortho=False)
-    params = get_layer('ff')[0](options, params, prefix='ff_logit',
-                                nin=options['dim_word'],
-                                nout=options['n_words'])
-
     return params
 
 
@@ -398,19 +423,28 @@ def build_model(tparams, options):
     n_timesteps = x.shape[0]
     n_samples = x.shape[1]
 
+    # dropout
+    n_rec_dropout_masks = 1 if ((options['decoder_rank'] != 'full') and options['decoder_share_proj_matrix']) else 3
+    word_dropout = shared_dropout_layer((n_timesteps, n_samples), use_noise, trng, options['retain_probability_word'])
+    word_dropout = tensor.shape_padright(word_dropout)
+    rec_dropout = shared_dropout_layer((n_rec_dropout_masks, n_samples, options['dim']), use_noise, trng, options['retain_probability_rec'])
+    readout_dropout = shared_dropout_layer((n_samples, options['dim']), use_noise, trng, options['retain_probability_readout'])
+    readout_dropout = tensor.shape_padleft(readout_dropout)
+
     # input
-    emb = tparams['Wemb'][x.flatten()]
-    emb = emb.reshape([n_timesteps, n_samples, options['dim_word']])
-    emb_shifted = tensor.zeros_like(emb)
-    emb_shifted = tensor.set_subtensor(emb_shifted[1:], emb[:-1])
-    emb = emb_shifted
-    opt_ret['emb'] = emb
+
+    x_shifted = tensor.zeros_like(x, dtype='int64')
+    x_shifted = tensor.set_subtensor(x_shifted[1:], x[:-1])
+    opt_ret['x_shifted'] = x_shifted
 
     # pass through gru layer, recurrence here
-    proj = get_layer(options['decoder'])[1](tparams, emb, options,
+    proj = get_layer(options['decoder'])[1](tparams, x_shifted, options,
                                             prefix='decoder',
                                             mask=x_mask,
+                                            integer_input=True,
                                             profile=profile,
+                                            word_dropout=word_dropout,
+                                            rec_dropout=rec_dropout,
                                             rank=options['decoder_rank'],
                                             share_proj_matrix=options['decoder_share_proj_matrix'],
                                             plus_diagonal=options['decoder_plus_diagonal'])
@@ -418,13 +452,8 @@ def build_model(tparams, options):
     opt_ret['proj_h'] = proj_h
 
     # compute word probabilities
-    logit_lstm = get_layer('ff')[1](tparams, proj_h, options,
-                                    prefix='ff_logit_lstm', activ='linear')
-    logit_prev = get_layer('ff')[1](tparams, emb, options,
-                                    prefix='ff_logit_prev', activ='linear')
-    logit = tensor.tanh(logit_lstm+logit_prev)
-    logit = get_layer('ff')[1](tparams, logit, options, prefix='ff_logit',
-                               activ='linear')
+    logit = get_layer('ff')[1](tparams, proj_h*readout_dropout, options,
+                                    prefix='ff_out', activ='linear')
     logit_shp = logit.shape
     probs = tensor.nnet.softmax(
         logit.reshape([logit_shp[0]*logit_shp[1], logit_shp[2]]))
@@ -436,81 +465,10 @@ def build_model(tparams, options):
     cost = cost.reshape([x.shape[0], x.shape[1]])
     opt_ret['cost_per_sample'] = cost
     #cost = (cost * x_mask).sum(0)
-    cost = (cost * x_mask).mean(0)   # Average cost over words
+    #cost = (cost * x_mask).mean(0)   # Average cost over words (wrong)
+    cost = (cost * x_mask).sum(0) / x_mask.sum(0) # Average cost over words
 
     return trng, use_noise, x, x_mask, opt_ret, cost
-
-
-# build a sampler
-def build_sampler(tparams, options, trng):
-    # x: 1 x 1
-    y = tensor.vector('y_sampler', dtype='int64')
-    init_state = tensor.matrix('init_state', dtype='float32')
-
-    # if it's the first word, emb should be all zero
-    emb = tensor.switch(y[:, None] < 0,
-                        tensor.alloc(0., 1, tparams['Wemb'].shape[1]),
-                        tparams['Wemb'][y])
-
-    # apply one step of gru layer
-    proj = get_layer(options['decoder'])[1](tparams, emb, options,
-                                            prefix='decoder',
-                                            mask=None,
-                                            one_step=True,
-                                            init_state=init_state,
-                                            profile=profile,
-                                            rank=options['decoder_rank'],
-                                            share_proj_matrix=options['decoder_share_proj_matrix'],
-                                            plus_diagonal=options['decoder_plus_diagonal'])
-    next_state = proj[0]
-
-    # compute the output probability dist and sample
-    logit_lstm = get_layer('ff')[1](tparams, next_state, options,
-                                    prefix='ff_logit_lstm', activ='linear')
-    logit_prev = get_layer('ff')[1](tparams, emb, options,
-                                    prefix='ff_logit_prev', activ='linear')
-    logit = tensor.tanh(logit_lstm+logit_prev)
-    logit = get_layer('ff')[1](tparams, logit, options,
-                               prefix='ff_logit', activ='linear')
-    next_probs = tensor.nnet.softmax(logit)
-    next_sample = trng.multinomial(pvals=next_probs).argmax(1)
-
-    # next word probability
-    print >> sys.stderr, 'Building f_next..',
-    inps = [y, init_state]
-    outs = [next_probs, next_sample, next_state]
-    f_next = theano.function(inps, outs, name='f_next', profile=profile)
-    print >> sys.stderr, 'Done'
-
-    return f_next
-
-
-# generate sample
-def gen_sample(tparams, f_next, options, trng=None, maxlen=30, argmax=False):
-
-    sample = []
-    sample_score = 0
-
-    # initial token is indicated by a -1 and initial state is zero
-    next_w = -1 * numpy.ones((1,)).astype('int64')
-    next_state = numpy.zeros((1, options['dim'])).astype('float32')
-
-    for ii in xrange(maxlen):
-        inps = [next_w, next_state]
-        ret = f_next(*inps)
-        next_p, next_w, next_state = ret[0], ret[1], ret[2]
-
-        if argmax:
-            nw = next_p[0].argmax()
-        else:
-            nw = next_w[0]
-        sample.append(nw)
-        sample_score += next_p[0, nw]
-        if nw == 0:
-            break
-
-    return sample, sample_score
-
 
 # calculate the log probablities on a given corpus using language model
 def pred_probs(f_log_probs, prepare_data, options, iterator, verbose=True):
@@ -658,7 +616,7 @@ def sgd(lr, tparams, grads, x, mask, y, cost):
     return f_grad_shared, f_update
 
 
-def train(dim_word=100,  # word vector dimensionality
+def train(
           dim=1000,  # the number of GRU units
           decoder='gru',
           patience=10,  # early stopping patience
@@ -687,6 +645,9 @@ def train(dim_word=100,  # word vector dimensionality
           decoder_rank='full', # 'full' or integer. If it is integer enables low-rank or low-rank plus diagonal parametrization (Miceli Barone 2016) arXiv:1603.03116
           decoder_share_proj_matrix=False, # in low-rank or low-rank plus diagonal mode, control whether the projection matrices are shared between the proposal, reset and update gates of the GRU
           decoder_plus_diagonal=True, # switch between low-rank and low-rank plus diagonal
+          retain_probability_word=0.9,
+          retain_probability_rec=0.5,
+          retain_probability_readout=0.5,
           ):
 
     # Model options
